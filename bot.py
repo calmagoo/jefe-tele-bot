@@ -1,40 +1,333 @@
-# bot.py - Complete TLO Personal Information Lookup
-import asyncio
-import logging
-import re
+# bot.py - Simple Nested Lookup Bot
 import os
-from datetime import datetime
-from typing import Dict, Optional
-import httpx
-from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
-from aiogram import Bot, Dispatcher, types
-from aiogram.filters import Command
-from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
-from aiogram.fsm.storage.memory import MemoryStorage
-from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
-from aiogram.enums import ParseMode
-from dotenv import load_dotenv
+import json
+import logging
+from telegram import Update
+from telegram.ext import Application, CommandHandler, ContextTypes
 
-load_dotenv()
+# Enable logging
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+logger = logging.getLogger(__name__)
 
-# ==================== CONFIGURATION ====================
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+# ===== CONFIGURATION =====
+BOT_TOKEN = os.environ.get('BOT_TOKEN')
+PORT = int(os.environ.get('PORT', 10000))
+
 if not BOT_TOKEN:
+    logger.error("BOT_TOKEN not set!")
     raise ValueError("BOT_TOKEN environment variable is required!")
 
-TLO_API_KEY = os.getenv("TLO_API_KEY")
-if not TLO_API_KEY:
-    raise ValueError("TLO_API_KEY environment variable is required!")
-
-TLO_API_URL = os.getenv("TLO_API_URL", "https://api.tlo.com/v2")
-
-# Allowed users - add your Telegram IDs here
-ALLOWED_USER_IDS = []
-allowed_str = os.getenv("ALLOWED_USER_IDS", "")
+# ===== ALLOWED USERS (Optional) =====
+# Leave empty to allow everyone, or add Telegram user IDs
+ALLOWED_USERS = []
+allowed_str = os.environ.get('ALLOWED_USER_IDS', '')
 if allowed_str:
-    ALLOWED_USER_IDS = [int(x.strip()) for x in allowed_str.split(",") if x.strip()]
-else:
+    ALLOWED_USERS = [int(x.strip()) for x in allowed_str.split(',') if x.strip()]
+
+# ===== DEFAULT DATA =====
+DEFAULT_DOCUMENT = {
+    "build_version": {
+        "model_name": "MacBook Pro",
+        "build_version": {
+            "processor_name": "Intel Core i7",
+            "processor_speed": "2.7 GHz",
+            "core_details": {
+                "build_version": "4",
+                "l2_cache(per_core)": "256 KB"
+            }
+        },
+        "number_of_cores": "4",
+        "memory": "256 KB"
+    },
+    "os_details": {
+        "product_version": "10.13.6",
+        "build_version": "17G65"
+    },
+    "name": "Test",
+    "date": "YYYY-MM-DD HH:MM:SS"
+}
+
+user_data = {}
+
+# ===== HELPERS =====
+async def check_user(update: Update) -> bool:
+    if not ALLOWED_USERS:
+        return True
+    if update.effective_user.id in ALLOWED_USERS:
+        return True
+    await update.message.reply_text("⛔ Unauthorized.")
+    return False
+
+# ===== COMMAND HANDLERS =====
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update):
+        return
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data:
+        user_data[user_id] = {"document": DEFAULT_DOCUMENT.copy()}
+    
+    welcome = """
+🤖 *Nested Lookup Bot*
+
+*Commands:*
+🔍 `/lookup <key>` - Find all values for a key
+📋 `/keys` - Show all unique keys
+📄 `/view` - View your document
+✏️ `/update <key> <value>` - Update a key
+🗑️ `/delete <key>` - Delete a key
+🔄 `/reset` - Reset to default
+📊 `/stats` - Show statistics
+❓ `/help` - Show this message
+
+*Example:* `/lookup build_version`
+    """
+    await update.message.reply_text(welcome, parse_mode='Markdown')
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await start(update, context)
+
+async def view(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update):
+        return
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data:
+        await update.message.reply_text("Please use /start first.")
+        return
+    
+    doc = user_data[user_id]["document"]
+    formatted = json.dumps(doc, indent=2, ensure_ascii=False)
+    
+    if len(formatted) > 4000:
+        formatted = formatted[:4000] + "\n... (truncated)"
+    
+    await update.message.reply_text(
+        f"📄 *Your Document:*\n```json\n{formatted}\n```",
+        parse_mode='Markdown'
+    )
+
+async def lookup(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update):
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /lookup <key>\nExample: /lookup build_version")
+        return
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data:
+        await update.message.reply_text("Please use /start first.")
+        return
+    
+    key = context.args[0]
+    doc = user_data[user_id]["document"]
+    
+    try:
+        from nested_lookup import nested_lookup
+        results = nested_lookup(key, doc)
+        
+        if not results:
+            await update.message.reply_text(f"Key '{key}' not found.")
+            return
+        
+        if len(results) == 1:
+            await update.message.reply_text(f"🔍 Found: `{results[0]}`", parse_mode='Markdown')
+        else:
+            response = f"🔍 Found {len(results)} values:\n"
+            for i, val in enumerate(results[:10], 1):
+                response += f"{i}. `{str(val)[:50]}`\n"
+            if len(results) > 10:
+                response += f"... and {len(results) - 10} more"
+            await update.message.reply_text(response, parse_mode='Markdown')
+            
+    except ImportError:
+        await update.message.reply_text("❌ nested_lookup module not installed. Please add it to requirements.txt")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def show_keys(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update):
+        return
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data:
+        await update.message.reply_text("Please use /start first.")
+        return
+    
+    doc = user_data[user_id]["document"]
+    
+    try:
+        from nested_lookup import get_all_keys
+        all_keys = get_all_keys(doc)
+        keys_list = sorted(list(all_keys))
+        
+        if not keys_list:
+            await update.message.reply_text("No keys found.")
+            return
+        
+        response = f"📋 *All Keys:* ({len(keys_list)} total)\n\n"
+        response += "\n".join([f"• `{k}`" for k in keys_list[:30]])
+        
+        if len(keys_list) > 30:
+            response += f"\n\n... and {len(keys_list) - 30} more"
+        
+        await update.message.reply_text(response, parse_mode='Markdown')
+        
+    except ImportError:
+        await update.message.reply_text("❌ nested_lookup module not installed.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def update_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update):
+        return
+    
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /update <key> <new_value>\nExample: /update model_name 'MacBook Air'")
+        return
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data:
+        await update.message.reply_text("Please use /start first.")
+        return
+    
+    key = context.args[0]
+    new_value = " ".join(context.args[1:])
+    
+    try:
+        from nested_lookup import nested_lookup, nested_update
+        doc = user_data[user_id]["document"]
+        old_count = len(nested_lookup(key, doc))
+        
+        if old_count == 0:
+            await update.message.reply_text(f"Key '{key}' not found.")
+            return
+        
+        nested_update(doc, key, new_value, in_place=True, treat_as_element=True)
+        user_data[user_id]["document"] = doc
+        
+        await update.message.reply_text(f"✅ Updated '{key}' {old_count} time(s).")
+        
+    except ImportError:
+        await update.message.reply_text("❌ nested_lookup module not installed.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def delete_key(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update):
+        return
+    
+    if not context.args:
+        await update.message.reply_text("Usage: /delete <key>\nExample: /delete memory")
+        return
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data:
+        await update.message.reply_text("Please use /start first.")
+        return
+    
+    key = context.args[0]
+    
+    try:
+        from nested_lookup import nested_lookup, nested_delete
+        doc = user_data[user_id]["document"]
+        old_count = len(nested_lookup(key, doc))
+        
+        if old_count == 0:
+            await update.message.reply_text(f"Key '{key}' not found.")
+            return
+        
+        nested_delete(doc, key, in_place=True)
+        user_data[user_id]["document"] = doc
+        
+        await update.message.reply_text(f"🗑️ Deleted '{key}' {old_count} time(s).")
+        
+    except ImportError:
+        await update.message.reply_text("❌ nested_lookup module not installed.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+async def reset(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update):
+        return
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data:
+        await update.message.reply_text("Please use /start first.")
+        return
+    
+    user_data[user_id]["document"] = DEFAULT_DOCUMENT.copy()
+    await update.message.reply_text("🔄 Document reset to default.")
+
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not await check_user(update):
+        return
+    
+    user_id = str(update.effective_user.id)
+    if user_id not in user_data:
+        await update.message.reply_text("Please use /start first.")
+        return
+    
+    doc = user_data[user_id]["document"]
+    
+    try:
+        from nested_lookup import get_all_keys
+        all_keys = get_all_keys(doc)
+        
+        response = f"""
+📊 *Document Statistics*
+
+• Total unique keys: `{len(all_keys)}`
+• Document size: `{len(json.dumps(doc))}` characters
+• Top-level keys: `{len(doc)}`
+"""
+        await update.message.reply_text(response, parse_mode='Markdown')
+        
+    except ImportError:
+        await update.message.reply_text("❌ nested_lookup module not installed.")
+    except Exception as e:
+        await update.message.reply_text(f"❌ Error: {str(e)}")
+
+# ===== MAIN =====
+
+def main():
+    logger.info("🤖 Starting bot...")
+    
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("view", view))
+    app.add_handler(CommandHandler("lookup", lookup))
+    app.add_handler(CommandHandler("keys", show_keys))
+    app.add_handler(CommandHandler("update", update_key))
+    app.add_handler(CommandHandler("delete", delete_key))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("stats", stats))
+    
+    webhook_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+    
+    if webhook_url:
+        logger.info(f"🚀 Starting webhook on port {PORT}")
+        logger.info(f"🔗 URL: https://{webhook_url}/webhook")
+        
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=f"https://{webhook_url}/webhook"
+        )
+    else:
+        logger.info("Starting polling mode...")
+        app.run_polling()
+
+if __name__ == "__main__":
+    main()else:
     ALLOWED_USER_IDS = [123456789]  # Replace with your ID
 
 RATE_LIMIT = int(os.getenv("RATE_LIMIT", "3"))
