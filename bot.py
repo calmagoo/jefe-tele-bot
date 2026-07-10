@@ -1,11 +1,13 @@
-# bot.py - Full TLO Personal Information Lookup
+# bot.py - Full TLO Personal Information Lookup (FIXED)
 import asyncio
 import logging
 import json
-import hashlib
+import re
+import os
 from datetime import datetime
 from typing import Optional, Dict, Any, List
 import httpx
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
@@ -14,27 +16,803 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 from aiogram.enums import ParseMode
 from dotenv import load_dotenv
-import os
 
 load_dotenv()
 
 # ==================== CONFIGURATION ====================
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-TLO_API_KEY = os.getenv("TLO_API_KEY")
-TLO_API_URL = os.getenv("TLO_API_URL", "https://api.tlo.com/v2")  # Replace with actual
+if not BOT_TOKEN:
+    raise ValueError("BOT_TOKEN environment variable is required!")
 
-# Only these two users can use the bot
-ALLOWED_USER_IDS = [123456789, 987654321]  # REPLACE WITH YOUR TELEGRAM IDs
+TLO_API_KEY = os.getenv("TLO_API_KEY")
+if not TLO_API_KEY:
+    raise ValueError("TLO_API_KEY environment variable is required!")
+
+TLO_API_URL = os.getenv("TLO_API_URL", "https://api.tlo.com/v2")
+
+# Allowed users from environment variable (comma-separated list of Telegram IDs)
+ALLOWED_USER_IDS = []
+allowed_users_str = os.getenv("ALLOWED_USER_IDS", "")
+if allowed_users_str:
+    ALLOWED_USER_IDS = [int(x.strip()) for x in allowed_users_str.split(",") if x.strip()]
+else:
+    # Default demo users - REPLACE WITH YOUR TELEGRAM IDs
+    ALLOWED_USER_IDS = [123456789, 987654321]
+
+RATE_LIMIT = int(os.getenv("RATE_LIMIT", "3"))  # requests per second
 
 # ==================== SETUP ====================
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 storage = MemoryStorage()
 bot = Bot(token=BOT_TOKEN, default=types.DefaultBotProperties(parse_mode=ParseMode.HTML))
 dp = Dispatcher(storage=storage)
 
-http_client = httpx.AsyncClient(timeout=60.0)  # Longer timeout for TLO
+# HTTP client with longer timeout
+http_client = httpx.AsyncClient(timeout=httpx.Timeout(60.0, connect=10.0))
+
+# Simple rate limiter
+class RateLimiter:
+    def __init__(self, max_requests_per_second: int = 3):
+        self.max_requests = max_requests_per_second
+        self.requests = []
+    
+    async def acquire(self):
+        now = datetime.now().timestamp()
+        # Remove requests older than 1 second
+        self.requests = [t for t in self.requests if now - t < 1.0]
+        
+        if len(self.requests) >= self.max_requests:
+            wait_time = 1.0 - (now - self.requests[0])
+            if wait_time > 0:
+                await asyncio.sleep(wait_time)
+        
+        self.requests.append(now)
+
+rate_limiter = RateLimiter(RATE_LIMIT)
+
+# ==================== STATES ====================
+class LookupStates(StatesGroup):
+    WAITING_FOR_PERSON_SEARCH = State()
+    WAITING_FOR_PROPERTY_SEARCH = State()
+    WAITING_FOR_DL = State()
+    WAITING_FOR_NAME = State()
+
+# ==================== TLO API CLIENT ====================
+class TLOClient:
+    """Complete TLO API Client with retry logic"""
+    
+    def __init__(self, api_key: str):
+        self.api_key = api_key
+        self.base_url = TLO_API_URL
+        self.headers = {
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json"
+        }
+    
+    @retry(
+        stop=stop_after_attempt(3),
+        wait=wait_exponential(multiplier=1, min=2, max=10),
+        retry=retry_if_exception_type((httpx.TimeoutException, httpx.ConnectError))
+    )
+    async def _request(self, method: str, endpoint: str, **kwargs) -> Dict:
+        """Generic request method with retry logic"""
+        url = f"{self.base_url}/{endpoint.lstrip('/')}"
+        
+        try:
+            await rate_limiter.acquire()
+            response = await http_client.request(
+                method,
+                url,
+                headers=self.headers,
+                **kwargs
+            )
+            response.raise_for_status()
+            return response.json()
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error: {e.response.status_code} - {e.response.text}")
+            raise
+        except Exception as e:
+            logger.error(f"Request error: {e}")
+            raise
+    
+    async def person_search(self, **kwargs) -> Dict:
+        """Search person by name, DOB, SSN, etc."""
+        # Build query parameters
+        params = {}
+        valid_fields = [
+            'first_name', 'last_name', 'middle_name', 'dob', 'ssn',
+            'dl_number', 'dl_state', 'address', 'city', 'state', 
+            'zip', 'phone', 'email'
+        ]
+        for key in valid_fields:
+            if key in kwargs and kwargs[key]:
+                params[key] = kwargs[key]
+        
+        return await self._request("POST", "person/search", json=params)
+    
+    async def get_full_report(self, person_id: str) -> Dict:
+        return await self._request("GET", f"person/{person_id}/full")
+    
+    async def get_mvr(self, dl_number: str, state: str) -> Dict:
+        return await self._request("POST", "mvr", json={
+            "dl_number": dl_number,
+            "state": state,
+            "include_history": True
+        })
+    
+    async def get_criminal_record(self, person_id: str) -> Dict:
+        return await self._request("GET", f"person/{person_id}/criminal")
+    
+    async def get_property_records(self, person_id: str) -> Dict:
+        return await self._request("GET", f"person/{person_id}/property")
+    
+    async def get_relatives(self, person_id: str) -> Dict:
+        return await self._request("GET", f"person/{person_id}/relatives")
+    
+    async def get_credit_header(self, ssn: str) -> Dict:
+        return await self._request("POST", "credit/header", json={"ssn": ssn})
+    
+    async def close(self):
+        """Close the HTTP client"""
+        pass  # We'll handle this at the bot level
+
+tlo = TLOClient(TLO_API_KEY)
+
+# ==================== AUDIT LOG ====================
+class AuditLogger:
+    """Simple audit logging"""
+    
+    def __init__(self, log_file: str = "audit.log"):
+        self.log_file = log_file
+        self._ensure_log_file()
+    
+    def _ensure_log_file(self):
+        if not os.path.exists(self.log_file):
+            with open(self.log_file, 'w') as f:
+                f.write("timestamp,user_id,username,action,query,result_count,ip\n")
+    
+    async def log(self, user_id: int, username: str, action: str, 
+                  query: str, result_count: int = 0, ip: str = "unknown"):
+        """Log an action to the audit file"""
+        timestamp = datetime.now().isoformat()
+        # Sanitize query to prevent CSV injection
+        query_safe = query.replace('"', '""').replace('\n', ' ')
+        
+        log_entry = f'"{timestamp}",{user_id},"{username}","{action}","{query_safe}",{result_count},"{ip}"\n'
+        
+        try:
+            with open(self.log_file, 'a', encoding='utf-8') as f:
+                f.write(log_entry)
+        except Exception as e:
+            logger.error(f"Failed to write audit log: {e}")
+
+audit_logger = AuditLogger()
+
+# ==================== AUTH MIDDLEWARE ====================
+async def check_user(message: Message) -> bool:
+    """Check if user is authorized"""
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    if user_id not in ALLOWED_USER_IDS:
+        logger.warning(f"Unauthorized access attempt from {username} ({user_id})")
+        await message.reply("⛔ Unauthorized access.")
+        return False
+    
+    return True
+
+# ==================== PARSING HELPER ====================
+def parse_person_query(query: str) -> Dict[str, str]:
+    """Parse name, DOB, SSN, DL from query string"""
+    params = {}
+    text = query.strip()
+    
+    # Detect SSN (###-##-####)
+    ssn_pattern = r'\b\d{3}[-]?\d{2}[-]?\d{4}\b'
+    ssn_match = re.search(ssn_pattern, text)
+    if ssn_match:
+        params['ssn'] = re.sub(r'[-]', '', ssn_match.group())
+        text = text.replace(ssn_match.group(), '').strip()
+    
+    # Detect DOB (MM/DD/YYYY or MM-DD-YYYY)
+    dob_patterns = [
+        r'\b\d{1,2}[/-]\d{1,2}[/-]\d{4}\b',
+        r'\b\d{1,2}[/-]\d{1,2}[/-]\d{2}\b'
+    ]
+    dob_match = None
+    for pattern in dob_patterns:
+        dob_match = re.search(pattern, text)
+        if dob_match:
+            break
+    if dob_match:
+        params['dob'] = dob_match.group()
+        text = text.replace(dob_match.group(), '').strip()
+    
+    # Detect DL (state + 5-10 digit number)
+    dl_pattern = r'\b([A-Z]{2})\s*(\d{5,10})\b'
+    dl_match = re.search(dl_pattern, text)
+    if dl_match:
+        params['dl_state'] = dl_match.group(1)
+        params['dl_number'] = dl_match.group(2)
+        text = text.replace(dl_match.group(), '').strip()
+    
+    # Remaining text is name
+    if text:
+        name_parts = text.split()
+        if len(name_parts) >= 2:
+            params['first_name'] = name_parts[0]
+            params['last_name'] = ' '.join(name_parts[1:])
+        else:
+            params['last_name'] = text
+    
+    return params
+
+# ==================== FORMATTERS ====================
+def format_person_info(data: Dict) -> str:
+    person = data.get('person', {})
+    demographics = person.get('demographics', {})
+    identifiers = person.get('identifiers', {})
+    contact = person.get('contact', {})
+    employment = person.get('employment', {})
+    education = person.get('education', {})
+    
+    text = f"""
+👤 <b>PERSONAL INFORMATION</b>
+{'=' * 40}
+
+<b>Full Name:</b> {demographics.get('full_name', 'N/A')}
+<b>AKA/Aliases:</b> {', '.join(person.get('aliases', [])) or 'N/A'}
+
+<b>Date of Birth:</b> {demographics.get('dob', 'N/A')}
+<b>Age:</b> {demographics.get('age', 'N/A')}
+<b>Gender:</b> {demographics.get('gender', 'N/A')}
+<b>Race:</b> {demographics.get('race', 'N/A')}
+
+<b>SSN:</b> {identifiers.get('ssn', 'N/A')}
+<b>Driver's License:</b> {identifiers.get('dl_number', 'N/A')}
+<b>DL State:</b> {identifiers.get('dl_state', 'N/A')}
+<b>DL Status:</b> {identifiers.get('dl_status', 'N/A')}
+
+<b>Current Address:</b> 
+{contact.get('address', 'N/A')}
+{contact.get('city', '')} {contact.get('state', '')} {contact.get('zip', '')}
+<b>Phone:</b> {contact.get('phone', 'N/A')}
+<b>Email:</b> {contact.get('email', 'N/A')}
+
+<b>Employment:</b>
+<b>Employer:</b> {employment.get('employer', 'N/A')}
+<b>Occupation:</b> {employment.get('occupation', 'N/A')}
+
+<b>Confidence Score:</b> {data.get('confidence', 0)}%
+"""
+    return text
+
+def format_mvr(data: Dict) -> str:
+    text = f"""
+🚗 <b>MOTOR VEHICLE REPORT</b>
+{'=' * 40}
+
+<b>Name:</b> {data.get('name', 'N/A')}
+<b>DL Number:</b> {data.get('dl_number', 'N/A')}
+<b>State:</b> {data.get('state', 'N/A')}
+<b>Status:</b> {data.get('status', 'N/A')}
+<b>License Class:</b> {data.get('class', 'N/A')}
+
+<b>License History:</b>
+"""
+    for record in data.get('history', [])[:5]:
+        text += f"  • {record.get('date', 'N/A')}: {record.get('action', 'N/A')}\n"
+    
+    if data.get('violations'):
+        text += f"\n<b>Recent Violations:</b>\n"
+        for violation in data.get('violations', [])[:5]:
+            text += f"  • {violation.get('date', 'N/A')}: {violation.get('offense', 'N/A')}\n"
+    
+    return text
+
+def format_criminal(data: Dict) -> str:
+    text = f"""
+⚖️ <b>CRIMINAL RECORD</b>
+{'=' * 40}
+
+<b>Felonies:</b>
+"""
+    for felony in data.get('felonies', [])[:5]:
+        text += f"  ⚠️ {felony.get('offense', 'N/A')} ({felony.get('date', 'N/A')})\n"
+    
+    text += f"\n<b>Misdemeanors:</b>\n"
+    for offense in data.get('misdemeanors', [])[:5]:
+        text += f"  • {offense.get('offense', 'N/A')} ({offense.get('date', 'N/A')})\n"
+    
+    if data.get('warrants'):
+        text += f"\n<b>Warrants:</b>\n"
+        for warrant in data.get('warrants', []):
+            text += f"  ⚠️ {warrant.get('type', 'N/A')} ({warrant.get('issued', 'N/A')})\n"
+    
+    return text
+
+def format_property(data: Dict) -> str:
+    text = f"""
+🏠 <b>PROPERTY RECORDS</b>
+{'=' * 40}
+
+<b>Properties Owned:</b>
+"""
+    for prop in data.get('properties', [])[:5]:
+        text += f"""
+  📍 {prop.get('address', 'N/A')}
+  • Type: {prop.get('type', 'N/A')}
+  • Value: ${prop.get('value', 'N/A'):,}
+  • Year Built: {prop.get('year_built', 'N/A')}
+"""
+    return text
+
+def format_relatives(data: Dict) -> str:
+    text = f"""
+👨‍👩‍👧‍👦 <b>RELATIVES & ASSOCIATES</b>
+{'=' * 40}
+
+<b>Immediate Family:</b>
+"""
+    for relative in data.get('immediate_family', [])[:5]:
+        text += f"  • {relative.get('name', 'N/A')} ({relative.get('relation', 'N/A')})\n"
+    
+    text += f"\n<b>Known Associates:</b>\n"
+    for associate in data.get('associates', [])[:5]:
+        text += f"  • {associate.get('name', 'N/A')}\n"
+    
+    return text
+
+# ==================== SPLIT MESSAGE HELPER ====================
+async def send_long_message(message: Message, text: str, title: str = ""):
+    """Split long messages into parts with labels"""
+    if len(text) <= 4096:
+        await message.reply(text)
+        return
+    
+    parts = [text[i:i+4096] for i in range(0, len(text), 4096)]
+    for i, part in enumerate(parts, 1):
+        header = f"📄 <b>{title}</b> (Part {i}/{len(parts)})\n\n"
+        await message.reply(header + part)
+
+# ==================== COMPLIANCE DISCLAIMER ====================
+COMPLIANCE_NOTICE = """
+<i>⚠️ <b>FCRA COMPLIANCE NOTICE</b></i>
+
+This information is a <b>consumer report</b> under the Fair Credit Reporting Act (FCRA).
+
+<b>You must have a permissible purpose</b> to obtain this report:
+• Employment screening (with consent)
+• Tenant screening (with consent)
+• Insurance underwriting
+• Government agency use
+• Court order or subpoena
+
+<b>You are required to:</b>
+• Provide adverse action notice if applicable
+• Maintain strict confidentiality
+• Dispose of information securely
+
+<i>Unauthorized use is a federal offense.</i>
+"""
+
+# ==================== BOT COMMANDS ====================
+@dp.message(Command("start"))
+async def cmd_start(message: Message):
+    if not await check_user(message):
+        return
+    
+    await audit_logger.log(
+        message.from_user.id,
+        message.from_user.username or str(message.from_user.id),
+        "start",
+        "/start"
+    )
+    
+    keyboard = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton("🔍 Person Search", callback_data="person_search")],
+            [InlineKeyboardButton("🚗 MVR Lookup", callback_data="mvr_lookup")],
+            [InlineKeyboardButton("⚖️ Criminal Check", callback_data="criminal_check")],
+            [InlineKeyboardButton("🏠 Property Records", callback_data="property_records")],
+            [InlineKeyboardButton("👨‍👩‍👧‍👦 Find Relatives", callback_data="find_relatives")],
+            [InlineKeyboardButton("📋 Compliance Info", callback_data="compliance")]
+        ]
+    )
+    
+    await message.reply(
+        "🔍 <b>TLO PERSONAL INFORMATION LOOKUP</b>\n\n"
+        "Select what you want to search for:\n"
+        "• Person Search - Name, DOB, SSN\n"
+        "• MVR - Driver's license history\n"
+        "• Criminal - Court records\n"
+        "• Property - Real estate owned\n"
+        "• Relatives - Family & associates\n\n"
+        "<i>All searches are logged and audited.</i>",
+        reply_markup=keyboard
+    )
+
+@dp.message(Command("help"))
+async def cmd_help(message: Message):
+    if not await check_user(message):
+        return
+    
+    await message.reply(
+        "📖 <b>Help & Commands</b>\n\n"
+        "/start - Main menu\n"
+        "/search <query> - Search person\n"
+        "/mvr <DL#> <state> - MVR lookup\n"
+        "/criminal <name> - Criminal check\n"
+        "/property <name> - Property records\n"
+        "/relatives <name> - Find relatives\n"
+        "/compliance - FCRA compliance info\n"
+        "/cancel - Cancel current operation\n"
+        "/help - This message\n\n"
+        "<i>All searches are monitored and logged.</i>"
+    )
+
+@dp.message(Command("cancel"))
+async def cmd_cancel(message: Message, state: FSMContext):
+    current_state = await state.get_state()
+    if current_state:
+        await state.clear()
+        await message.reply("✅ Cancelled current operation.")
+    else:
+        await message.reply("❌ Nothing to cancel.")
+
+@dp.message(Command("compliance"))
+async def cmd_compliance(message: Message):
+    if not await check_user(message):
+        return
+    
+    await message.reply(COMPLIANCE_NOTICE)
+
+# ==================== PERSON SEARCH ====================
+@dp.callback_query(lambda c: c.data == "person_search")
+async def callback_person_search(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.reply(
+        "👤 <b>PERSON SEARCH</b>\n\n"
+        "Please provide the person's information.\n\n"
+        "Examples:\n"
+        "<code>John Doe</code>\n"
+        "<code>John Doe 01/15/1980</code>\n"
+        "<code>John Doe CA DL1234567</code>\n"
+        "<code>John Doe 123-45-6789</code>\n\n"
+        "Type /cancel to stop.",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(LookupStates.WAITING_FOR_PERSON_SEARCH)
+    await callback.answer()
+
+@dp.message(LookupStates.WAITING_FOR_PERSON_SEARCH)
+async def process_person_search(message: Message, state: FSMContext):
+    await handle_person_search(message, state)
+
+async def handle_person_search(message: Message, state: FSMContext):
+    query = message.text.strip()
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    params = parse_person_query(query)
+    
+    if not params:
+        await message.reply("❌ I couldn't parse your input. Please provide at least a name.")
+        return
+    
+    await audit_logger.log(user_id, username, "person_search", query, 0)
+    await message.reply("⏳ Searching TLO database...")
+    
+    try:
+        result = await tlo.person_search(**params)
+        
+        if not result.get('found'):
+            await message.reply("❌ No matching records found.")
+            await state.clear()
+            return
+        
+        person_id = result['person_id']
+        full_report = await tlo.get_full_report(person_id)
+        
+        formatted = format_person_info(full_report)
+        await send_long_message(message, formatted, "Personal Information")
+        
+        # Additional options
+        keyboard = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [InlineKeyboardButton("🚗 Get MVR", callback_data=f"mvr_{person_id}")],
+                [InlineKeyboardButton("⚖️ Criminal Check", callback_data=f"criminal_{person_id}")],
+                [InlineKeyboardButton("🏠 Property Records", callback_data=f"property_{person_id}")],
+                [InlineKeyboardButton("👨‍👩‍👧‍👦 Relatives", callback_data=f"relatives_{person_id}")]
+            ]
+        )
+        await message.reply(
+            "📋 <b>Additional Reports Available:</b>",
+            reply_markup=keyboard
+        )
+        
+        await audit_logger.log(user_id, username, "person_search_result", query, 1)
+        
+    except Exception as e:
+        logger.error(f"Person search error: {e}")
+        await message.reply(f"❌ Error: {str(e)}")
+    
+    await state.clear()
+
+# ==================== MVR LOOKUP ====================
+@dp.callback_query(lambda c: c.data == "mvr_lookup")
+async def callback_mvr(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.reply(
+        "🚗 <b>MVR LOOKUP</b>\n\n"
+        "Please send the driver's license number and state.\n\n"
+        "Example: <code>D1234567 CA</code>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(LookupStates.WAITING_FOR_DL)
+    await callback.answer()
+
+@dp.message(LookupStates.WAITING_FOR_DL)
+async def process_mvr(message: Message, state: FSMContext):
+    text = message.text.strip().upper()
+    parts = text.split()
+    
+    if len(parts) < 2:
+        await message.reply("❌ Please provide DL number and state.\nExample: <code>D1234567 CA</code>")
+        return
+    
+    dl_number = parts[0]
+    dl_state = parts[1]
+    
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    await audit_logger.log(user_id, username, "mvr_lookup", f"{dl_number} {dl_state}", 0)
+    await message.reply("⏳ Retrieving Motor Vehicle Report...")
+    
+    try:
+        result = await tlo.get_mvr(dl_number, dl_state)
+        
+        if not result.get('found'):
+            await message.reply("❌ No MVR records found.")
+            await state.clear()
+            return
+        
+        formatted = format_mvr(result)
+        await send_long_message(message, formatted, "MVR Report")
+        await audit_logger.log(user_id, username, "mvr_result", f"{dl_number} {dl_state}", 1)
+            
+    except Exception as e:
+        await message.reply(f"❌ Error: {str(e)}")
+    
+    await state.clear()
+
+# ==================== CRIMINAL CHECK ====================
+@dp.callback_query(lambda c: c.data == "criminal_check")
+async def callback_criminal(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.reply(
+        "⚖️ <b>CRIMINAL RECORD CHECK</b>\n\n"
+        "Please send the person's full name and DOB.\n\n"
+        "Example: <code>John Doe 01/15/1980</code>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(LookupStates.WAITING_FOR_NAME)
+    await callback.answer()
+
+@dp.message(LookupStates.WAITING_FOR_NAME)
+async def process_criminal(message: Message, state: FSMContext):
+    await handle_criminal_search(message, state)
+
+async def handle_criminal_search(message: Message, state: FSMContext):
+    text = message.text.strip()
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    params = parse_person_query(text)
+    
+    await audit_logger.log(user_id, username, "criminal_search", text, 0)
+    await message.reply("⏳ Checking criminal records...")
+    
+    try:
+        result = await tlo.person_search(**params)
+        
+        if not result.get('found'):
+            await message.reply("❌ No matching records found.")
+            await state.clear()
+            return
+        
+        person_id = result['person_id']
+        criminal = await tlo.get_criminal_record(person_id)
+        
+        formatted = format_criminal(criminal)
+        await send_long_message(message, formatted, "Criminal Record")
+        await audit_logger.log(user_id, username, "criminal_result", text, 1)
+        
+    except Exception as e:
+        await message.reply(f"❌ Error: {str(e)}")
+    
+    await state.clear()
+
+# ==================== PROPERTY RECORDS ====================
+@dp.callback_query(lambda c: c.data == "property_records")
+async def callback_property(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.reply(
+        "🏠 <b>PROPERTY RECORDS</b>\n\n"
+        "Please send the person's name or address to search.\n\n"
+        "Example: <code>John Doe</code>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(LookupStates.WAITING_FOR_PROPERTY_SEARCH)
+    await callback.answer()
+
+@dp.message(LookupStates.WAITING_FOR_PROPERTY_SEARCH)
+async def process_property(message: Message, state: FSMContext):
+    query = message.text.strip()
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    await audit_logger.log(user_id, username, "property_search", query, 0)
+    await message.reply("⏳ Searching property records...")
+    
+    try:
+        params = parse_person_query(query)
+        result = await tlo.person_search(**params)
+        
+        if not result.get('found'):
+            await message.reply("❌ No records found.")
+            await state.clear()
+            return
+        
+        person_id = result['person_id']
+        property_records = await tlo.get_property_records(person_id)
+        
+        formatted = format_property(property_records)
+        await send_long_message(message, formatted, "Property Records")
+        await audit_logger.log(user_id, username, "property_result", query, 1)
+            
+    except Exception as e:
+        await message.reply(f"❌ Error: {str(e)}")
+    
+    await state.clear()
+
+# ==================== FIND RELATIVES ====================
+@dp.callback_query(lambda c: c.data == "find_relatives")
+async def callback_relatives(callback: types.CallbackQuery, state: FSMContext):
+    await callback.message.reply(
+        "👨‍👩‍👧‍👦 <b>FIND RELATIVES</b>\n\n"
+        "Please send the person's name and DOB.\n\n"
+        "Example: <code>John Doe 01/15/1980</code>",
+        parse_mode=ParseMode.HTML
+    )
+    await state.set_state(LookupStates.WAITING_FOR_NAME)
+    await callback.answer()
+
+@dp.message(LookupStates.WAITING_FOR_NAME)
+async def process_relatives(message: Message, state: FSMContext):
+    text = message.text.strip()
+    user_id = message.from_user.id
+    username = message.from_user.username or str(user_id)
+    
+    params = parse_person_query(text)
+    
+    await audit_logger.log(user_id, username, "relatives_search", text, 0)
+    await message.reply("⏳ Finding relatives...")
+    
+    try:
+        result = await tlo.person_search(**params)
+        
+        if not result.get('found'):
+            await message.reply("❌ No matching records found.")
+            await state.clear()
+            return
+        
+        person_id = result['person_id']
+        relatives = await tlo.get_relatives(person_id)
+        
+        formatted = format_relatives(relatives)
+        await send_long_message(message, formatted, "Relatives Report")
+        await audit_logger.log(user_id, username, "relatives_result", text, 1)
+        
+    except Exception as e:
+        await message.reply(f"❌ Error: {str(e)}")
+    
+    await state.clear()
+
+# ==================== ADDITIONAL REPORT CALLBACKS ====================
+@dp.callback_query(lambda c: c.data.startswith("mvr_"))
+async def callback_mvr_result(callback: types.CallbackQuery):
+    person_id = callback.data.split("_")[1]
+    await callback.message.reply(f"⏳ Retrieving MVR for person ID: {person_id}")
+    # This would need actual implementation with the person's DL info
+    await callback.answer("MVR lookup requires DL number and state")
+
+@dp.callback_query(lambda c: c.data.startswith("criminal_"))
+async def callback_criminal_result(callback: types.CallbackQuery):
+    person_id = callback.data.split("_")[1]
+    user_id = callback.from_user.id
+    username = callback.from_user.username or str(user_id)
+    
+    await audit_logger.log(user_id, username, "criminal_person_id", person_id, 0)
+    await callback.message.reply("⏳ Retrieving criminal records...")
+    
+    try:
+        criminal = await tlo.get_criminal_record(person_id)
+        formatted = format_criminal(criminal)
+        await send_long_message(callback.message, formatted, "Criminal Record")
+        await audit_logger.log(user_id, username, "criminal_person_result", person_id, 1)
+    except Exception as e:
+        await callback.message.reply(f"❌ Error: {str(e)}")
+    
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("property_"))
+async def callback_property_result(callback: types.CallbackQuery):
+    person_id = callback.data.split("_")[1]
+    user_id = callback.from_user.id
+    username = callback.from_user.username or str(user_id)
+    
+    await audit_logger.log(user_id, username, "property_person_id", person_id, 0)
+    await callback.message.reply("⏳ Retrieving property records...")
+    
+    try:
+        property_records = await tlo.get_property_records(person_id)
+        formatted = format_property(property_records)
+        await send_long_message(callback.message, formatted, "Property Records")
+        await audit_logger.log(user_id, username, "property_person_result", person_id, 1)
+    except Exception as e:
+        await callback.message.reply(f"❌ Error: {str(e)}")
+    
+    await callback.answer()
+
+@dp.callback_query(lambda c: c.data.startswith("relatives_"))
+async def callback_relatives_result(callback: types.CallbackQuery):
+    person_id = callback.data.split("_")[1]
+    user_id = callback.from_user.id
+    username = callback.from_user.username or str(user_id)
+    
+    await audit_logger.log(user_id, username, "relatives_person_id", person_id, 0)
+    await callback.message.reply("⏳ Retrieving relatives...")
+    
+    try:
+        relatives = await tlo.get_relatives(person_id)
+        formatted = format_relatives(relatives)
+        await send_long_message(callback.message, formatted, "Relatives Report")
+        await audit_logger.log(user_id, username, "relatives_person_result", person_id, 1)
+    except Exception as e:
+        await callback.message.reply(f"❌ Error: {str(e)}")
+    
+    await callback.answer()
+
+# ==================== COMPLIANCE CALLBACK ====================
+@dp.callback_query(lambda c: c.data == "compliance")
+async def callback_compliance(callback: types.CallbackQuery):
+    await callback.message.reply(COMPLIANCE_NOTICE)
+    await callback.answer()
+
+# ==================== MAIN ====================
+async def main():
+    logger.info("🚀 Starting TLO Personal Info Bot...")
+    logger.info(f"👥 Allowed users: {ALLOWED_USER_IDS}")
+    logger.info(f"📊 Rate limit: {RATE_LIMIT} requests/second")
+    
+    try:
+        await bot.delete_webhook()
+        await dp.start_polling(bot, allowed_updates=types.UpdateType.MESSAGE)
+    finally:
+        await http_client.aclose()
+        await bot.session.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped by user")
+    except Exception as e:
+        logger.error(f"Fatal error: {e}")http_client = httpx.AsyncClient(timeout=60.0)  # Longer timeout for TLO
 
 # ==================== STATES ====================
 class LookupStates(StatesGroup):
