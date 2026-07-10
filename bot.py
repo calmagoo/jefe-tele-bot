@@ -4987,3 +4987,37 @@ def main():
 
 if __name__ == "__main__":
     main()
+# ===== MAIN =====
+
+def main():
+    logger.info("🤖 Starting bot...")
+    
+    app = Application.builder().token(BOT_TOKEN).build()
+    
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("view", view))
+    app.add_handler(CommandHandler("lookup", lookup))
+    app.add_handler(CommandHandler("keys", show_keys))
+    app.add_handler(CommandHandler("update", update_key))
+    app.add_handler(CommandHandler("delete", delete_key))
+    app.add_handler(CommandHandler("reset", reset))
+    app.add_handler(CommandHandler("stats", stats))
+    
+    webhook_url = os.environ.get('RAILWAY_PUBLIC_DOMAIN')
+    
+    if webhook_url:
+        logger.info(f"🚀 Starting webhook on port {PORT}")
+        logger.info(f"🔗 URL: https://{webhook_url}/webhook")
+        
+        app.run_webhook(
+            listen="0.0.0.0",
+            port=PORT,
+            webhook_url=f"https://{webhook_url}/webhook"
+        )
+    else:
+        logger.info("Starting polling mode...")
+        app.run_polling()
+
+if __name__ == "__main__":
+    main()
